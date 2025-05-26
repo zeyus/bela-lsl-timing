@@ -5,3 +5,10 @@
 This Bela app will consume streams and record digital inputs to a log file, allowing you to see how performance changes with different network conditions, number of devices, number of streams, frequency, etc.
 
 The digital input monitoring allows you to provide arbitrary external timing events, which could come from a trigger devices, or in the case of our experimental setup, the event start pins come from an FSR sensor on the iPad touch screen to record the moment of user-interaction, and then the event end pins come from a photodiode that displays a visual stimulus once the LSL input has been recieved on a second iPad (and vice-versa).
+
+
+# Acknowledgements
+
+- [Christian A. Kothe: liblsl](https://github.com/sccn/liblsl) for the LSL library
+- [armlabs: OLED SSD1306 Linux driver](https://github.com/armlabs/ssd1306_linux) for the OLED driver
+- [Liam Donovan <liam@bela.io>: Bela](https://bela.io) for the Bela platform
