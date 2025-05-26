@@ -20,34 +20,37 @@
 const int kOledI2cDev = 1;
 
 // Digital I/O pin configuration
-const int eventStartPins[] = {0, 1, 2, 3};
-const int eventEndPins[] = {12, 13, 14, 15};
-const int kNumStartPins = sizeof(eventStartPins) / sizeof(eventStartPins[0]);
-const int kNumEndPins = sizeof(eventEndPins) / sizeof(eventEndPins[0]);
-const int kTotalPins = kNumStartPins + kNumEndPins;
+const unsigned int eventStartPins[] = {0, 1, 2, 3};
+const unsigned int eventEndPins[] = {12, 13, 14, 15};
+const unsigned int kNumStartPins = sizeof(eventStartPins) / sizeof(eventStartPins[0]);
+const unsigned int kNumEndPins = sizeof(eventEndPins) / sizeof(eventEndPins[0]);
+const unsigned int kTotalPins = kNumStartPins + kNumEndPins;
 
 // LSL Configuration
 const char* streamPrefixFilter = "LSLTest";
 float sampleTimeout = 0.0;
 
 // Logging Configuration
-int gElapsedFrames = 0;  // Placeholder for elapsed time
-const int fs = 44100;    // Audio sample rate, can be adjusted as needed
+uint64_t gElapsedFrames = 0;  // Placeholder for elapsed time
+const unsigned int fs = 44100;    // Audio sample rate, can be adjusted as needed
+const unsigned int periodSize = 16; // number of frames per period -> this MUST match the period size in the Bela project settings
 const size_t kEventBufferSize = 8192;  // Circular buffer size
 const size_t kFlushThreshold = 1024;   // Flush when buffer reaches this size
 const int logRandomSuffix = rand() % 10000;  // Random suffix for log file
-// Log file path
-const std::string kLogFilePath = "./";
-const std::string kLogFileBaseName = "timing_log_";
-const std::string kLogFileExtension = ".csv";
-// Log file name
-const char* kLogFileName = (kLogFilePath + kLogFileBaseName +
-                            std::to_string(logRandomSuffix) + kLogFileExtension)
-                               .c_str();
+// Log file configuration - FIX: Use std::string instead of const char*
+std::string generateLogFileName() {
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    static std::uniform_int_distribution<> dis(1000, 9999);
+    
+    return std::string("./timing_log_") + std::to_string(dis(gen)) + ".csv";
+}
+
+const std::string kLogFileName = generateLogFileName();
 
 // Event structure for logging
 struct TimingEvent {
-  double system_timestamp;  // Bela elapsed time
+  uint64_t system_frame;  // Bela elapsed time
   double lsl_timestamp;     // LSL timestamp or NaN for pin events
   enum Type { PIN_CHANGE, LSL_SAMPLE } type;
 
@@ -61,7 +64,7 @@ struct TimingEvent {
   double sample_timestamp;  // Original sample timestamp
 
   TimingEvent()
-      : system_timestamp(0.0),
+      : system_frame(0),
         lsl_timestamp(std::numeric_limits<double>::quiet_NaN()),
         type(PIN_CHANGE),
         pin_number(-1),
@@ -149,9 +152,9 @@ double getElapsedTime() {
   return gElapsedFrames / fs;  // Convert to seconds
 }
 
-void logPinChange(int pin, bool state, double timestamp, double lslTimestamp) {
+void logPinChange(int pin, bool state, uint64_t timestamp, double lslTimestamp) {
   TimingEvent event;
-  event.system_timestamp = timestamp;
+  event.system_frame = timestamp;
   event.lsl_timestamp = lslTimestamp;
   event.type = TimingEvent::PIN_CHANGE;
   event.pin_number = pin;
@@ -169,7 +172,7 @@ void logPinChange(int pin, bool state, double timestamp, double lslTimestamp) {
 void logLSLSample(const std::string& streamName, const std::vector<float>& data,
                   double sampleTimestamp, double receiveTimestamp) {
   TimingEvent event;
-  event.system_timestamp = getElapsedTime();
+  event.system_frame = gElapsedFrames;
   event.lsl_timestamp = receiveTimestamp;
   event.type = TimingEvent::LSL_SAMPLE;
   event.stream_name = streamName;
@@ -185,7 +188,7 @@ std::string formatCSVLine(const TimingEvent& event) {
   std::ostringstream oss;
   oss << std::fixed << std::setprecision(9);
 
-  oss << event.system_timestamp << ",";
+  oss << event.system_frame << ",";
 
   if (std::isnan(event.lsl_timestamp)) {
     oss << ",";
@@ -295,7 +298,7 @@ bool setup(BelaContext* context, void* userData) {
     logFile << "system_timestamp,lsl_timestamp,event_type,pin_number,pin_state,"
                "stream_name,sample_timestamp,sample_data,pin_states\n";
     logFile.close();
-    rt_printf("Created log file: %s\n", kLogFileName);
+    rt_printf("Created log file: %s\n", kLogFileName.c_str());
   } else {
     rt_printf("Warning: Could not create log file\n");
   }
@@ -305,8 +308,17 @@ bool setup(BelaContext* context, void* userData) {
 
   // Schedule the first resolution task
   Bela_scheduleAuxiliaryTask(gResolveStreamsTask);
+  // Schedule the first display task
+  Bela_scheduleAuxiliaryTask(gDisplayPinStatesTask);
 
   rt_printf("Setup complete. Monitoring %d pins.\n", kTotalPins);
+
+  // Show bela context details
+  rt_printf("Bela context: %d audio channels, %d digital frames, %d analog "
+            "frames, sample rate (digital): %f\n"
+            "sample rate (analog): %f\n",
+            context->audioInChannels, context->digitalFrames,
+            context->analogFrames, context->digitalSampleRate, context->audioSampleRate);
 
   return true;
 }
@@ -316,39 +328,47 @@ void render(BelaContext* context, void* userData) {
   // Monitor digital pins for changes
   bool anyChange = false;
   // get timestamp and lsl timestamp
-  double timestamp = getElapsedTime();
   double lslTimestamp = lsl_local_clock();
 
-  for (int i = 0; i < context->digitalFrames; i++) {
+  for (unsigned int n = 0; n < context->digitalFrames; n++) {
     // Check start pins
-    for (int j = 0; j < kNumStartPins; j++) {
-      bool state = digitalRead(context, i, eventStartPins[j]);
+    for (unsigned int j = 0; j < kNumStartPins; j++) {
+      bool state = digitalRead(context, n, eventStartPins[j]);
       if (state != previousPinStates[j]) {
         currentPinStates[j] = state;
-        logPinChange(eventStartPins[j], state, timestamp, lslTimestamp);
+        logPinChange(eventStartPins[j], state, gElapsedFrames+n, lslTimestamp);
         previousPinStates[j] = state;
         anyChange = true;
       }
     }
 
     // Check end pins
-    for (int j = 0; j < kNumEndPins; j++) {
-      bool state = digitalRead(context, i, eventEndPins[j]);
+    for (unsigned int j = 0; j < kNumEndPins; j++) {
+      bool state = digitalRead(context, n, eventEndPins[j]);
       int pinIndex = j + kNumStartPins;
       if (state != previousPinStates[pinIndex]) {
         currentPinStates[pinIndex] = state;
-        logPinChange(eventEndPins[j], state, timestamp, lslTimestamp);
+        logPinChange(eventEndPins[j], state, gElapsedFrames+n, lslTimestamp);
         previousPinStates[pinIndex] = state;
         anyChange = true;
       }
     }
+
+    // write nothing
+    for(unsigned int j = 0; j < context->audioOutChannels; j++){
+			audioWrite(context, n, j, 0.0); // audio output
+		}
+  }
+  // If any pin state changed, schedule the display task
+  if (anyChange) {
+    Bela_scheduleAuxiliaryTask(gDisplayPinStatesTask);
   }
   // Schedule stream resolving -> this will happen once per second
   // the render cycle is called at the audio sample rate divided by the number
   // of digital frames
   static unsigned int count = 0;
   if (count++ %
-          (unsigned int)(context->digitalSampleRate / context->digitalFrames) ==
+          (unsigned int)(fs / periodSize) ==
       0) {
     if (shouldResolveStreams) {
       Bela_scheduleAuxiliaryTask(gResolveStreamsTask);
@@ -405,7 +425,7 @@ void resolveStreams(void*) {
 #ifdef USE_OLED_DISPLAY
     ssd1306_oled_clear_line(2);
     ssd1306_oled_set_XY(0, 2);
-    ssd1306_oled_write_string(SSD1306_FONT_NORMAL, (char*)"No streams");
+    ssd1306_oled_write_line(SSD1306_FONT_NORMAL, (char*)"No streams");
 #endif
     return;
   }
@@ -445,7 +465,7 @@ void resolveStreams(void*) {
     ssd1306_oled_set_XY(0, 2);
     std::string streamStr = "Streams: " + std::to_string(validStreams) + " / " +
                             std::to_string(availableStreams.size());
-    ssd1306_oled_write_string(SSD1306_FONT_NORMAL, (char*)streamStr.c_str());
+    ssd1306_oled_write_line(SSD1306_FONT_NORMAL, (char*)streamStr.c_str());
 #endif
 
     streamsResolved = true;
@@ -454,15 +474,17 @@ void resolveStreams(void*) {
 
 void displayPinStates(void*) {
 #ifdef USE_OLED_DISPLAY
-  ssd1306_oled_set_XY(0, 5);
+  ssd1306_oled_clear_line(4);
+  ssd1306_oled_set_XY(0, 4);
   std::string pinStateStr = "P: |";
   for (int i = 0; i < kTotalPins; i++) {
     pinStateStr += (currentPinStates[i] ? "X|" : "-|");
   }
-  ssd1306_oled_write_string(SSD1306_FONT_NORMAL, (char*)pinStateStr.c_str());
+  ssd1306_oled_write_line(SSD1306_FONT_NORMAL, (char*)pinStateStr.c_str());
   if (gBufferFull) {
-    ssd1306_oled_set_XY(0, 6);
-    ssd1306_oled_write_string(SSD1306_FONT_NORMAL, (char*)"E: BUF FULL!!!");
+    ssd1306_oled_clear_line(5);
+    ssd1306_oled_set_XY(0, 5);
+    ssd1306_oled_write_line(SSD1306_FONT_NORMAL, (char*)"E: BUF FULL!!!");
   }
 #endif
 }
