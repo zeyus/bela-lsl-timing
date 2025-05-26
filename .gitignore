@@ -1,0 +1,9 @@
+.DS_Store
+# C / CPP
+*.o
+*.obj
+*.exe
+*.dll
+
+# ide
+.vscode/
