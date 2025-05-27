@@ -4,5 +4,5 @@
 ../Bela/scripts/build_project.sh \
   -p bela-lsl-timing \
   --force \
-  -m "CPPFLAGS='-std=c++17 -I./include' LDLIBS=./lib/liblsl.so" \
+  -m "CPPFLAGS='-std=c++17 -I./include' LDLIBS=/root/Bela/projects/bela-lsl-timing/lib/liblsl.so" \
   ./

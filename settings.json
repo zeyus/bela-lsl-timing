@@ -10,7 +10,7 @@
     "--mute-speaker": "1",
     "--disable-led": "1",
     "--stop-button-pin": "-1",
-    "--high-performance-mode": "1",
+    // "--high-performance-mode": null,
     "-H0,": "-6",
     "-H1,": "-6",
     "-H2,": "-6",

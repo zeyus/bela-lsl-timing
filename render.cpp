@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstring>  // for memcpy
 #include <fstream>
 #include <include/linux_i2c.c>
 #include <include/ssd1306.c>
@@ -22,7 +23,8 @@ const int kOledI2cDev = 1;
 // Digital I/O pin configuration
 const unsigned int eventStartPins[] = {0, 1, 2, 3};
 const unsigned int eventEndPins[] = {12, 13, 14, 15};
-const unsigned int kNumStartPins = sizeof(eventStartPins) / sizeof(eventStartPins[0]);
+const unsigned int kNumStartPins =
+    sizeof(eventStartPins) / sizeof(eventStartPins[0]);
 const unsigned int kNumEndPins = sizeof(eventEndPins) / sizeof(eventEndPins[0]);
 const unsigned int kTotalPins = kNumStartPins + kNumEndPins;
 
@@ -31,211 +33,219 @@ const char* streamPrefixFilter = "LSLTest";
 float sampleTimeout = 0.0;
 
 // Logging Configuration
-uint64_t gElapsedFrames = 0;  // Placeholder for elapsed time
-const unsigned int fs = 44100;    // Audio sample rate, can be adjusted as needed
-const unsigned int periodSize = 16; // number of frames per period -> this MUST match the period size in the Bela project settings
-const size_t kEventBufferSize = 8192;  // Circular buffer size
-const size_t kFlushThreshold = 1024;   // Flush when buffer reaches this size
-const int logRandomSuffix = rand() % 10000;  // Random suffix for log file
-// Log file configuration - FIX: Use std::string instead of const char*
-std::string generateLogFileName() {
-    static std::random_device rd;
-    static std::mt19937 gen(rd());
-    static std::uniform_int_distribution<> dis(1000, 9999);
-    
-    return std::string("./timing_log_") + std::to_string(dis(gen)) + ".csv";
-}
+uint64_t gElapsedFrames = 0;
+const unsigned int fs = 44100;
+const unsigned int periodSize = 16;
+const size_t kEventBufferSize = 16384;  // Increased for better buffering
+const size_t kFlushThreshold = 2048;
+const int logRandomSuffix = rand() % 10000;
 
-const std::string kLogFileName = generateLogFileName();
+// Constants for pre-allocated buffers
+const size_t kMaxStreamNameLength = 64;
+const size_t kMaxChannelsPerStream = 32;
 
-// Event structure for logging
-struct TimingEvent {
-  uint64_t system_frame;  // Bela elapsed time
-  double lsl_timestamp;     // LSL timestamp or NaN for pin events
+// Lightweight event structure for real-time safe logging
+struct RTTimingEvent {
+  uint64_t system_frame;
   enum Type { PIN_CHANGE, LSL_SAMPLE } type;
 
   // Pin change data
   int pin_number;
   bool pin_state;
 
-  // LSL sample data
-  std::string stream_name;
-  std::vector<float> sample_data;
-  double sample_timestamp;  // Original sample timestamp
+  // LSL sample data (fixed-size for RT safety)
+  char stream_name[kMaxStreamNameLength];
+  float sample_data[kMaxChannelsPerStream];
+  size_t sample_data_count;
+  double sample_timestamp;  // This will store the interpolated LSL time
 
-  TimingEvent()
-      : system_frame(0),
-        lsl_timestamp(std::numeric_limits<double>::quiet_NaN()),
-        type(PIN_CHANGE),
-        pin_number(-1),
-        pin_state(false),
-        sample_timestamp(0.0) {}
+  // Pin states snapshot
+  uint16_t pin_states_snapshot;  // Bit field for up to 16 pins
 };
 
-// Circular buffer for events
-class EventBuffer {
+// Lock-free SPSC (Single Producer Single Consumer) queue for better RT
+// performance
+template <typename T, size_t Size>
+class LockFreeSPSCQueue {
  private:
-  std::vector<TimingEvent> buffer;
-  std::atomic<size_t> write_pos{0};
-  std::atomic<size_t> read_pos{0};
-  std::atomic<size_t> count{0};
+  alignas(64) std::atomic<size_t> write_pos{0};  // Cache line aligned
+  alignas(64) std::atomic<size_t> read_pos{0};   // Cache line aligned
+  T buffer[Size];
 
  public:
-  EventBuffer(size_t size) : buffer(size) {}
+  bool push(const T& item) {
+    size_t current_write = write_pos.load(std::memory_order_relaxed);
+    size_t next_write = (current_write + 1) % Size;
 
-  bool push(const TimingEvent& event) {
-    size_t current_count = count.load();
-    if (current_count >= buffer.size()) {
-      return false;  // Buffer full
+    if (next_write == read_pos.load(std::memory_order_acquire)) {
+      return false;  // Queue full
     }
 
-    size_t pos = write_pos.load();
-    buffer[pos] = event;
-    write_pos.store((pos + 1) % buffer.size());
-    count.fetch_add(1);
+    buffer[current_write] = item;
+    write_pos.store(next_write, std::memory_order_release);
     return true;
   }
 
-  bool pop(TimingEvent& event) {
-    size_t current_count = count.load();
-    if (current_count == 0) {
-      return false;  // Buffer empty
+  bool pop(T& item) {
+    size_t current_read = read_pos.load(std::memory_order_relaxed);
+
+    if (current_read == write_pos.load(std::memory_order_acquire)) {
+      return false;  // Queue empty
     }
 
-    size_t pos = read_pos.load();
-    event = buffer[pos];
-    read_pos.store((pos + 1) % buffer.size());
-    count.fetch_sub(1);
+    item = buffer[current_read];
+    read_pos.store((current_read + 1) % Size, std::memory_order_release);
     return true;
   }
 
-  size_t size() const { return count.load(); }
-  bool empty() const { return count.load() == 0; }
+  size_t size_approx() const {
+    size_t w = write_pos.load(std::memory_order_relaxed);
+    size_t r = read_pos.load(std::memory_order_relaxed);
+    return (w >= r) ? (w - r) : (Size - r + w);
+  }
 };
 
 // Global variables
 std::atomic<bool> shouldResolveStreams{true};
 std::vector<lsl::stream_info> availableStreams;
 std::vector<lsl::stream_inlet*> streamInlets;
-std::vector<std::vector<float>> streamData;
 std::vector<std::string> streamNames;
 bool streamsResolved = false;
-bool gBufferFull = false;
 
-// Pin state tracking
-std::vector<bool> currentPinStates;
-std::vector<bool> previousPinStates;
+// RT-safe event queue
+LockFreeSPSCQueue<RTTimingEvent, kEventBufferSize> rtEventQueue;
 
-// Event logging
-std::unique_ptr<EventBuffer> eventBuffer;
-lsl::continuous_resolver* resolver = nullptr;
+// Separate queue for LSL samples (written by aux task, read by logger)
+LockFreeSPSCQueue<RTTimingEvent, 4096> lslEventQueue;
+
+// Pin state tracking - use atomics for thread safety
+std::atomic<uint16_t> currentPinStatesAtomic{0};
+uint16_t previousPinStates = 0;
+
+// Timing variables for auxiliary task
+std::atomic<double> lastLSLTimestamp{0.0};
+std::atomic<bool> bufferFullFlag{false};
+
+// Timestamp synchronization for interpolation
+struct TimestampSync {
+  uint64_t belaFrame;
+  double lslTime;
+  std::atomic<bool> valid{false};
+};
+
+// Use triple buffering for lock-free updates
+TimestampSync syncBuffers[3];
+std::atomic<int> currentSyncIndex{0};
+std::atomic<int> previousSyncIndex{1};
 
 // Auxiliary tasks
 AuxiliaryTask gResolveStreamsTask;
 AuxiliaryTask gPullSamplesTask;
 AuxiliaryTask gLogWriterTask;
 AuxiliaryTask gDisplayPinStatesTask;
+AuxiliaryTask gTimestampUpdateTask;
+
+// LSL resolver
+lsl::continuous_resolver* resolver = nullptr;
 
 // Function declarations
 void resolveStreams(void*);
 void pullSamples(void*);
 void writeLogData(void*);
-double getElapsedTime();
 void displayPinStates(void*);
-void logPinChange(int pin, bool state, double timestamp, double lslTimestamp);
-void logLSLSample(const std::string& streamName, const std::vector<float>& data,
-                  double sampleTimestamp, double receiveTimestamp);
-std::string formatCSVLine(const TimingEvent& event);
+void updateLSLTimestamp(void*);
+uint16_t getPinStateBitfield();
+void setPinStateBit(uint16_t& bitfield, int index, bool state);
+bool getPinStateBit(uint16_t bitfield, int index);
 
-// Calculate elapsed time in seconds
-double getElapsedTime() {
-  return gElapsedFrames / fs;  // Convert to seconds
+// Helper functions
+std::string generateLogFileName() {
+  static std::random_device rd;
+  static std::mt19937 gen(rd());
+  static std::uniform_int_distribution<> dis(1000, 9999);
+  return std::string("./timing_log_") + std::to_string(dis(gen)) + ".csv";
 }
 
-void logPinChange(int pin, bool state, uint64_t timestamp, double lslTimestamp) {
-  TimingEvent event;
-  event.system_frame = timestamp;
-  event.lsl_timestamp = lslTimestamp;
-  event.type = TimingEvent::PIN_CHANGE;
-  event.pin_number = pin;
-  event.pin_state = state;
+const std::string kLogFileName = generateLogFileName();
 
-  if (!eventBuffer->push(event)) {
-    // Buffer is full, log a warning
-    if (!gBufferFull) {
-      gBufferFull = true;  // Set flag to avoid flooding with warnings
-    }
-    rt_printf("Warning: Event buffer full, dropping pin change event\n");
-  }
+// RT-safe pin state helpers
+uint16_t getPinStateBitfield() {
+  return currentPinStatesAtomic.load(std::memory_order_relaxed);
 }
 
-void logLSLSample(const std::string& streamName, const std::vector<float>& data,
-                  double sampleTimestamp, double receiveTimestamp) {
-  TimingEvent event;
-  event.system_frame = gElapsedFrames;
-  event.lsl_timestamp = receiveTimestamp;
-  event.type = TimingEvent::LSL_SAMPLE;
-  event.stream_name = streamName;
-  event.sample_data = data;
-  event.sample_timestamp = sampleTimestamp;
-
-  if (!eventBuffer->push(event)) {
-    rt_printf("Warning: Event buffer full, dropping LSL sample event\n");
-  }
-}
-
-std::string formatCSVLine(const TimingEvent& event) {
-  std::ostringstream oss;
-  oss << std::fixed << std::setprecision(9);
-
-  oss << event.system_frame << ",";
-
-  if (std::isnan(event.lsl_timestamp)) {
-    oss << ",";
+void setPinStateBit(uint16_t& bitfield, int index, bool state) {
+  if (state) {
+    bitfield |= (1 << index);
   } else {
-    oss << event.lsl_timestamp << ",";
+    bitfield &= ~(1 << index);
+  }
+}
+
+bool getPinStateBit(uint16_t bitfield, int index) {
+  return (bitfield >> index) & 1;
+}
+
+// Update LSL timestamp with synchronization info
+void updateLSLTimestamp(void*) {
+  // Find the buffer that's not being used for reading
+  int writeIndex = 2;  // Use the third buffer for writing
+  int currentRead = currentSyncIndex.load(std::memory_order_acquire);
+  int previousRead = previousSyncIndex.load(std::memory_order_acquire);
+
+  // Make sure we're not writing to a buffer being read
+  if (writeIndex == currentRead || writeIndex == previousRead) {
+    writeIndex = (currentRead != 0 && previousRead != 0)   ? 0
+                 : (currentRead != 1 && previousRead != 1) ? 1
+                                                           : 2;
   }
 
-  if (event.type == TimingEvent::PIN_CHANGE) {
-    oss << "PIN_CHANGE," << event.pin_number << ","
-        << (event.pin_state ? "1" : "0") << ",,,";
+  // Update the write buffer
+  syncBuffers[writeIndex].belaFrame = gElapsedFrames;
+  syncBuffers[writeIndex].lslTime = lsl::local_clock();
+  syncBuffers[writeIndex].valid.store(true, std::memory_order_release);
 
-    // Add current state of all pins
-    for (int i = 0; i < kTotalPins; i++) {
-      int pin = (i < kNumStartPins) ? eventStartPins[i]
-                                    : eventEndPins[i - kNumStartPins];
-      bool state =
-          (pin == event.pin_number) ? event.pin_state : currentPinStates[i];
-      oss << (state ? "1" : "0");
-      if (i < kTotalPins - 1) oss << ";";
-    }
-  } else {
-    oss << "LSL_SAMPLE,,," << event.stream_name << "," << event.sample_timestamp
-        << ",";
+  // Rotate buffers: current becomes previous, write buffer becomes current
+  int oldPrevious = previousSyncIndex.load(std::memory_order_relaxed);
+  previousSyncIndex.store(currentRead, std::memory_order_release);
+  currentSyncIndex.store(writeIndex, std::memory_order_release);
 
-    // Add sample data
-    for (size_t i = 0; i < event.sample_data.size(); i++) {
-      oss << event.sample_data[i];
-      if (i < event.sample_data.size() - 1) oss << ";";
-    }
-    oss << ",";
+  // Also update simple timestamp for non-critical uses
+  lastLSLTimestamp.store(syncBuffers[writeIndex].lslTime,
+                         std::memory_order_relaxed);
+}
 
-    // Add current state of all pins
-    for (int i = 0; i < kTotalPins; i++) {
-      oss << (currentPinStates[i] ? "1" : "0");
-      if (i < kTotalPins - 1) oss << ";";
-    }
+// RT-safe interpolation of LSL timestamp
+double interpolateLSLTime(uint64_t currentFrame) {
+  int currentIdx = currentSyncIndex.load(std::memory_order_acquire);
+  int previousIdx = previousSyncIndex.load(std::memory_order_acquire);
+
+  const TimestampSync& sync2 = syncBuffers[currentIdx];
+  const TimestampSync& sync1 = syncBuffers[previousIdx];
+
+  // Check if we have valid sync points
+  if (!sync2.valid.load(std::memory_order_acquire) ||
+      !sync1.valid.load(std::memory_order_acquire) ||
+      sync2.belaFrame == sync1.belaFrame) {
+    return sync2.lslTime;  // Can't interpolate, return latest
   }
 
-  oss << "\n";
-  return oss.str();
+  // Linear interpolation between sync points
+  double frameSpan = static_cast<double>(sync2.belaFrame - sync1.belaFrame);
+  double timeSpan = sync2.lslTime - sync1.lslTime;
+  double framesSinceSync1 = static_cast<double>(currentFrame - sync1.belaFrame);
+
+  // Clamp to prevent extrapolation beyond sync2
+  if (framesSinceSync1 > frameSpan) {
+    framesSinceSync1 = frameSpan;
+  }
+
+  return sync1.lslTime + (framesSinceSync1 * timeSpan / frameSpan);
 }
 
 bool setup(BelaContext* context, void* userData) {
   rt_printf("Using LSL library version: %d.%d\n", lsl::library_version() / 100,
             lsl::library_version() % 100);
 
-  // Validate pin configuration
   if (kNumStartPins != kNumEndPins) {
     rt_printf("Error: Mismatched number of event start and end pins.\n");
     return false;
@@ -243,23 +253,11 @@ bool setup(BelaContext* context, void* userData) {
 
   rt_printf("Setting up event pins...\n");
 
-  // Initialize pin state tracking
-  currentPinStates.resize(kTotalPins, false);
-  previousPinStates.resize(kTotalPins, false);
-
   // Set up digital pins
   for (int i = 0; i < kNumStartPins; i++) {
     pinMode(context, 0, eventStartPins[i], INPUT);
     pinMode(context, 0, eventEndPins[i], INPUT);
-    // Read initial states
-    currentPinStates[i] = false;
-    currentPinStates[i + kNumStartPins] = false;
-    previousPinStates[i] = currentPinStates[i];
-    previousPinStates[i + kNumStartPins] = currentPinStates[i + kNumStartPins];
   }
-
-  // Initialize event buffer
-  eventBuffer = std::make_unique<EventBuffer>(kEventBufferSize);
 
 #ifdef USE_OLED_DISPLAY
   rt_printf("Setting up OLED display...\n");
@@ -271,28 +269,29 @@ bool setup(BelaContext* context, void* userData) {
 #endif
 
   // Create auxiliary tasks
-  // low priority task for resolving streams, this happens less frequently
-  // anyway
   if ((gResolveStreamsTask = Bela_createAuxiliaryTask(&resolveStreams, 40,
                                                       "resolve-streams")) == 0)
     return false;
 
-  // highest priority task for pulling samples
   if ((gPullSamplesTask =
            Bela_createAuxiliaryTask(&pullSamples, 80, "pull-samples")) == 0)
     return false;
 
-  // medium priority task for writing log data
   if ((gLogWriterTask =
            Bela_createAuxiliaryTask(&writeLogData, 50, "log-writer")) == 0)
     return false;
 
-  // low priority task for displaying pin states
+    #if USE_OLED_DISPLAY
   if ((gDisplayPinStatesTask = Bela_createAuxiliaryTask(
            &displayPinStates, 30, "display-pin-states")) == 0)
     return false;
+#endif
 
-  // Initialize log file with CSV header
+  if ((gTimestampUpdateTask = Bela_createAuxiliaryTask(
+           &updateLSLTimestamp, 85, "timestamp-update")) == 0)
+    return false;
+
+  // Initialize log file
   std::ofstream logFile(kLogFileName, std::ios::out | std::ios::trunc);
   if (logFile.is_open()) {
     logFile << "system_timestamp,lsl_timestamp,event_type,pin_number,pin_state,"
@@ -306,38 +305,69 @@ bool setup(BelaContext* context, void* userData) {
   // Create continuous resolver
   resolver = new lsl::continuous_resolver();
 
-  // Schedule the first resolution task
+  // Initialize timestamp synchronization buffers
+  double initialTime = lsl::local_clock();
+  for (int i = 0; i < 3; i++) {
+    syncBuffers[i].belaFrame = 0;
+    syncBuffers[i].lslTime = initialTime;
+    syncBuffers[i].valid.store(true, std::memory_order_release);
+  }
+
+  // Schedule initial tasks
   Bela_scheduleAuxiliaryTask(gResolveStreamsTask);
-  // Schedule the first display task
   Bela_scheduleAuxiliaryTask(gDisplayPinStatesTask);
+  Bela_scheduleAuxiliaryTask(gTimestampUpdateTask);
 
   rt_printf("Setup complete. Monitoring %d pins.\n", kTotalPins);
-
-  // Show bela context details
-  rt_printf("Bela context: %d audio channels, %d digital frames, %d analog "
-            "frames, sample rate (digital): %f\n"
-            "sample rate (analog): %f\n",
-            context->audioInChannels, context->digitalFrames,
-            context->analogFrames, context->digitalSampleRate, context->audioSampleRate);
+  rt_printf(
+      "Bela context: %d audio channels, %d digital frames, period size: %d\n",
+      context->audioInChannels, context->digitalFrames, periodSize);
 
   return true;
 }
 
 void render(BelaContext* context, void* userData) {
-  gElapsedFrames = context->audioFramesElapsed;  // Update elapsed frames
-  // Monitor digital pins for changes
-  bool anyChange = false;
-  // get timestamp and lsl timestamp
-  double lslTimestamp = lsl_local_clock();
+  gElapsedFrames = context->audioFramesElapsed;
 
+  // Get current pin state bitfield
+  uint16_t currentStates =
+      currentPinStatesAtomic.load(std::memory_order_relaxed);
+  uint16_t newStates = currentStates;
+
+  // Get interpolated LSL timestamp for this render cycle
+  double interpolatedLSLTime = interpolateLSLTime(gElapsedFrames);
+
+  bool anyChange = false;
+
+  // Process all digital frames
   for (unsigned int n = 0; n < context->digitalFrames; n++) {
+    // Calculate precise frame timestamp
+    uint64_t frameNumber = gElapsedFrames + n;
+    double frameLSLTime =
+        interpolatedLSLTime + (n * (1.0 / context->digitalSampleRate));
+
     // Check start pins
     for (unsigned int j = 0; j < kNumStartPins; j++) {
       bool state = digitalRead(context, n, eventStartPins[j]);
-      if (state != previousPinStates[j]) {
-        currentPinStates[j] = state;
-        logPinChange(eventStartPins[j], state, gElapsedFrames+n, lslTimestamp);
-        previousPinStates[j] = state;
+      bool prevState = getPinStateBit(previousPinStates, j);
+
+      if (state != prevState) {
+        setPinStateBit(newStates, j, state);
+        setPinStateBit(previousPinStates, j, state);
+
+        // Create RT-safe event with interpolated timestamp
+        RTTimingEvent event;
+        event.system_frame = frameNumber;
+        event.type = RTTimingEvent::PIN_CHANGE;
+        event.pin_number = eventStartPins[j];
+        event.pin_state = state;
+        event.pin_states_snapshot = newStates;
+        event.sample_timestamp = frameLSLTime;  // Store interpolated LSL time
+
+        if (!rtEventQueue.push(event)) {
+          bufferFullFlag.store(true, std::memory_order_relaxed);
+        }
+
         anyChange = true;
       }
     }
@@ -346,42 +376,75 @@ void render(BelaContext* context, void* userData) {
     for (unsigned int j = 0; j < kNumEndPins; j++) {
       bool state = digitalRead(context, n, eventEndPins[j]);
       int pinIndex = j + kNumStartPins;
-      if (state != previousPinStates[pinIndex]) {
-        currentPinStates[pinIndex] = state;
-        logPinChange(eventEndPins[j], state, gElapsedFrames+n, lslTimestamp);
-        previousPinStates[pinIndex] = state;
+      bool prevState = getPinStateBit(previousPinStates, pinIndex);
+
+      if (state != prevState) {
+        setPinStateBit(newStates, pinIndex, state);
+        setPinStateBit(previousPinStates, pinIndex, state);
+
+        // Create RT-safe event with interpolated timestamp
+        RTTimingEvent event;
+        event.system_frame = frameNumber;
+        event.type = RTTimingEvent::PIN_CHANGE;
+        event.pin_number = eventEndPins[j];
+        event.pin_state = state;
+        event.pin_states_snapshot = newStates;
+        event.sample_timestamp = frameLSLTime;  // Store interpolated LSL time
+
+        if (!rtEventQueue.push(event)) {
+          bufferFullFlag.store(true, std::memory_order_relaxed);
+        }
+
         anyChange = true;
       }
     }
 
-    // write nothing
-    for(unsigned int j = 0; j < context->audioOutChannels; j++){
-			audioWrite(context, n, j, 0.0); // audio output
-		}
-  }
-  // If any pin state changed, schedule the display task
-  if (anyChange) {
-    Bela_scheduleAuxiliaryTask(gDisplayPinStatesTask);
-  }
-  // Schedule stream resolving -> this will happen once per second
-  // the render cycle is called at the audio sample rate divided by the number
-  // of digital frames
-  static unsigned int count = 0;
-  if (count++ %
-          (unsigned int)(fs / periodSize) ==
-      0) {
-    if (shouldResolveStreams) {
-      Bela_scheduleAuxiliaryTask(gResolveStreamsTask);
+    // Write silence to audio outputs
+    for (unsigned int j = 0; j < context->audioOutChannels; j++) {
+      audioWrite(context, n, j, 0.0f);
     }
   }
 
-  // If there are inlets, pull samples
-  if (!streamInlets.empty()) {
+  // Update atomic pin states if changed
+  if (anyChange) {
+    currentPinStatesAtomic.store(newStates, std::memory_order_relaxed);
+  }
+
+  // Schedule auxiliary tasks with minimal overhead
+  // renderCount increments once every render cycle
+  // which is <period> frames
+  static unsigned int renderCount = 0;
+
+  renderCount++;
+
+  // Update LSL timestamp synchronization every ~50ms for good interpolation
+  if (renderCount % (fs / periodSize / 20) == 0) {
+    Bela_scheduleAuxiliaryTask(gTimestampUpdateTask);
+  }
+
+  // Display update only when needed
+#if USE_OLED_DISPLAY
+  static unsigned int lastDisplayUpdate = 0;
+  if (renderCount % (fs / periodSize / 10) == 0) { // Update every 100ms
+    Bela_scheduleAuxiliaryTask(gDisplayPinStatesTask);
+    lastDisplayUpdate = renderCount;
+  }
+#endif
+
+  // Stream resolution once per second
+  if (renderCount % (fs / periodSize) == 0 && shouldResolveStreams) {
+    Bela_scheduleAuxiliaryTask(gResolveStreamsTask);
+  }
+
+  // Pull samples more frequently when streams are available
+  if (!streamInlets.empty() && renderCount % 10 == 0) {
     Bela_scheduleAuxiliaryTask(gPullSamplesTask);
   }
 
-  // Schedule log writer if buffer has enough data or periodically
-  if (eventBuffer->size() >= kFlushThreshold || count % 1000 == 0) {
+  // Schedule log writer based on queue size
+  size_t queueSize = rtEventQueue.size_approx() + lslEventQueue.size_approx();
+  if (queueSize >= kFlushThreshold ||
+      (renderCount % 1000 == 0 && queueSize > 0)) {
     Bela_scheduleAuxiliaryTask(gLogWriterTask);
   }
 }
@@ -389,13 +452,16 @@ void render(BelaContext* context, void* userData) {
 void cleanup(BelaContext* context, void* userData) {
   rt_fprintf(stderr,
              "Cleaning up...Please wait for the logs to finish writing.\n");
-  // Final flush of event buffer
-  while (!eventBuffer->empty()) {
+
+  // Final flush of event buffers
+  int flushAttempts = 0;
+  while ((rtEventQueue.size_approx() > 0 || lslEventQueue.size_approx() > 0) &&
+         flushAttempts < 100) {
     Bela_scheduleAuxiliaryTask(gLogWriterTask);
-    usleep(100000);  // Wait 10ms for log writer to process
+    usleep(10000);
+    flushAttempts++;
   }
-  rt_printf("Finalizing cleanup...\n");
-// Close and clean up OLED display
+
 #ifdef USE_OLED_DISPLAY
   ssd1306_oled_clear_screen();
   ssd1306_oled_set_XY(0, 0);
@@ -403,19 +469,23 @@ void cleanup(BelaContext* context, void* userData) {
   ssd1306_end();
 #endif
 
-  // Close and clean up stream inlets
+  // Clean up stream inlets
   for (auto inlet : streamInlets) {
-    inlet->close_stream();
-    delete inlet;
+    if (inlet) {
+      inlet->close_stream();
+      delete inlet;
+    }
   }
   streamInlets.clear();
 
   // Clean up resolver
   delete resolver;
 
-  rt_printf("Cleanup complete. Final event buffer size: %zu\n",
-            eventBuffer->size());
+  rt_printf("Cleanup complete. Events remaining: RT=%zu, LSL=%zu\n",
+            rtEventQueue.size_approx(), lslEventQueue.size_approx());
 }
+
+// Auxiliary task implementations
 
 void resolveStreams(void*) {
   bool needToReopen = streamInlets.empty();
@@ -436,7 +506,6 @@ void resolveStreams(void*) {
       delete inlet;
     }
     streamInlets.clear();
-    streamData.clear();
     streamNames.clear();
 
     size_t validStreams = 0;
@@ -445,7 +514,6 @@ void resolveStreams(void*) {
         try {
           lsl::stream_inlet* inlet = new lsl::stream_inlet(info, 360, 0, true);
           streamInlets.push_back(inlet);
-          streamData.push_back(std::vector<float>(info.channel_count()));
           streamNames.push_back(info.name());
           inlet->open_stream(1.0);
           validStreams++;
@@ -474,14 +542,17 @@ void resolveStreams(void*) {
 
 void displayPinStates(void*) {
 #ifdef USE_OLED_DISPLAY
+  uint16_t states = currentPinStatesAtomic.load(std::memory_order_relaxed);
+
   ssd1306_oled_clear_line(4);
   ssd1306_oled_set_XY(0, 4);
   std::string pinStateStr = "P: |";
   for (int i = 0; i < kTotalPins; i++) {
-    pinStateStr += (currentPinStates[i] ? "X|" : "-|");
+    pinStateStr += (getPinStateBit(states, i) ? "X|" : "-|");
   }
   ssd1306_oled_write_line(SSD1306_FONT_NORMAL, (char*)pinStateStr.c_str());
-  if (gBufferFull) {
+
+  if (bufferFullFlag.load(std::memory_order_relaxed)) {
     ssd1306_oled_clear_line(5);
     ssd1306_oled_set_XY(0, 5);
     ssd1306_oled_write_line(SSD1306_FONT_NORMAL, (char*)"E: BUF FULL!!!");
@@ -493,22 +564,38 @@ void pullSamples(void*) {
   if (!streamsResolved || streamInlets.empty()) return;
 
   double receiveTime = lsl::local_clock();
+  std::vector<float> sampleBuffer(kMaxChannelsPerStream);
 
   for (size_t i = 0; i < streamInlets.size(); i++) {
     try {
       double sampleTimestamp =
-          streamInlets[i]->pull_sample(streamData[i], sampleTimeout);
+          streamInlets[i]->pull_sample(sampleBuffer, sampleTimeout);
 
       if (sampleTimestamp != 0.0) {
-        logLSLSample(streamNames[i], streamData[i], sampleTimestamp,
-                     receiveTime);
+        // Create RT-safe event for LSL sample
+        RTTimingEvent event;
+        event.system_frame = gElapsedFrames;
+        event.type = RTTimingEvent::LSL_SAMPLE;
 
-        rt_printf("LSL %s: [", streamNames[i].c_str());
-        for (size_t j = 0; j < streamData[i].size(); j++) {
-          rt_printf("%.3f", streamData[i][j]);
-          if (j < streamData[i].size() - 1) rt_printf(", ");
+        // Copy stream name safely
+        strncpy(event.stream_name, streamNames[i].c_str(),
+                kMaxStreamNameLength - 1);
+        event.stream_name[kMaxStreamNameLength - 1] = '\0';
+
+        // Copy sample data
+        event.sample_data_count =
+            std::min(sampleBuffer.size(), kMaxChannelsPerStream);
+        memcpy(event.sample_data, sampleBuffer.data(),
+               event.sample_data_count * sizeof(float));
+
+        event.sample_timestamp = sampleTimestamp;
+        event.pin_states_snapshot =
+            currentPinStatesAtomic.load(std::memory_order_relaxed);
+
+        // Push to LSL queue
+        if (!lslEventQueue.push(event)) {
+          rt_printf("LSL event queue full\n");
         }
-        rt_printf("] t=%.6f\n", sampleTimestamp);
       }
     } catch (lsl::lost_error& e) {
       rt_printf("Stream %s lost: %s\n", streamNames[i].c_str(), e.what());
@@ -525,17 +612,13 @@ void pullSamples(void*) {
   // Clean up null pointers
   auto it = streamInlets.begin();
   auto nameIt = streamNames.begin();
-  auto dataIt = streamData.begin();
-
   while (it != streamInlets.end()) {
     if (*it == nullptr) {
       it = streamInlets.erase(it);
       nameIt = streamNames.erase(nameIt);
-      dataIt = streamData.erase(dataIt);
     } else {
       ++it;
       ++nameIt;
-      ++dataIt;
     }
   }
 
@@ -545,31 +628,75 @@ void pullSamples(void*) {
 }
 
 void writeLogData(void*) {
-  if (eventBuffer->empty()) return;
-
   std::ofstream logFile(kLogFileName, std::ios::out | std::ios::app);
   if (!logFile.is_open()) {
     rt_printf("Error: Could not open log file for writing\n");
     return;
   }
 
-  TimingEvent event;
+  RTTimingEvent event;
   size_t eventsWritten = 0;
 
-  while (eventBuffer->pop(event)) {
-    logFile << formatCSVLine(event);
-    eventsWritten++;
+  // Process RT events first (higher priority)
+  while (rtEventQueue.pop(event) && eventsWritten < 1000) {
+    // Format CSV line - now using interpolated timestamp from event
+    logFile << event.system_frame << "," << std::fixed << std::setprecision(9)
+            << event.sample_timestamp << ",";
 
-    // Limit writes per call to avoid blocking too long
-    if (eventsWritten >= 500) {
-      break;
+    if (event.type == RTTimingEvent::PIN_CHANGE) {
+      logFile << "PIN_CHANGE," << event.pin_number << ","
+              << (event.pin_state ? "1" : "0") << ",,,";
+    } else {
+      logFile << "LSL_SAMPLE,,," << event.stream_name << ","
+              << event.sample_timestamp << ",";
+
+      for (size_t i = 0; i < event.sample_data_count; i++) {
+        logFile << event.sample_data[i];
+        if (i < event.sample_data_count - 1) logFile << ";";
+      }
+      logFile << ",";
     }
+
+    // Add pin states
+    for (int i = 0; i < kTotalPins; i++) {
+      logFile << (getPinStateBit(event.pin_states_snapshot, i) ? "1" : "0");
+      if (i < kTotalPins - 1) logFile << ";";
+    }
+
+    logFile << "\n";
+    eventsWritten++;
+  }
+
+  // Process LSL events if we have room
+  while (lslEventQueue.pop(event) && eventsWritten < 1500) {
+    // Get current LSL time for receive timestamp
+    double currentLSLTime = lastLSLTimestamp.load(std::memory_order_relaxed);
+
+    // Format LSL event
+    logFile << event.system_frame << "," << std::fixed << std::setprecision(9)
+            << currentLSLTime << ","
+            << "LSL_SAMPLE,,," << event.stream_name << ","
+            << event.sample_timestamp << ",";
+
+    for (size_t i = 0; i < event.sample_data_count; i++) {
+      logFile << event.sample_data[i];
+      if (i < event.sample_data_count - 1) logFile << ";";
+    }
+    logFile << ",";
+
+    for (int i = 0; i < kTotalPins; i++) {
+      logFile << (getPinStateBit(event.pin_states_snapshot, i) ? "1" : "0");
+      if (i < kTotalPins - 1) logFile << ";";
+    }
+
+    logFile << "\n";
+    eventsWritten++;
   }
 
   logFile.close();
 
   if (eventsWritten > 0) {
-    rt_printf("Wrote %zu events to log. Buffer size: %zu\n", eventsWritten,
-              eventBuffer->size());
+    rt_printf("Wrote %zu events. Queues: RT=%zu, LSL=%zu\n", eventsWritten,
+              rtEventQueue.size_approx(), lslEventQueue.size_approx());
   }
 }
