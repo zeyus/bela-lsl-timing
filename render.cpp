@@ -2,6 +2,7 @@
 #include <include/font.h>
 #include <include/lsl_cpp.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstring>  // for memcpy
@@ -31,6 +32,8 @@ const unsigned int kTotalPins = kNumStartPins + kNumEndPins;
 // LSL Configuration
 const char* streamPrefixFilter = "LSLTest";
 float sampleTimeout = 0.0;
+// Add this global variable at the top of your file
+std::atomic<bool> pullSamplesRunning{false};
 
 // Logging Configuration
 uint64_t gElapsedFrames = 0;
@@ -55,12 +58,25 @@ struct RTTimingEvent {
 
   // LSL sample data (fixed-size for RT safety)
   char stream_name[kMaxStreamNameLength];
-  std::string sample_data[kMaxChannelsPerStream];
+  static const size_t kMaxSampleStringLength = 256;
+  char sample_data[kMaxChannelsPerStream][kMaxSampleStringLength];
   size_t sample_data_count;
   double sample_timestamp;  // This will store the interpolated LSL time
 
   // Pin states snapshot
   uint16_t pin_states_snapshot;  // Bit field for up to 16 pins
+
+  RTTimingEvent()
+      : system_frame(0),
+        type(PIN_CHANGE),
+        pin_number(0),
+        pin_state(false),
+        sample_data_count(0),
+        sample_timestamp(0.0),
+        pin_states_snapshot(0) {
+    memset(stream_name, 0, kMaxStreamNameLength);
+    memset(sample_data, 0, sizeof(sample_data));
+  }
 };
 
 // Lock-free SPSC (Single Producer Single Consumer) queue for better RT
@@ -205,7 +221,7 @@ void updateLSLTimestamp(void*) {
   syncBuffers[writeIndex].valid.store(true, std::memory_order_release);
 
   // Rotate buffers: current becomes previous, write buffer becomes current
-  int oldPrevious = previousSyncIndex.load(std::memory_order_relaxed);
+  // int oldPrevious = previousSyncIndex.load(std::memory_order_relaxed);
   previousSyncIndex.store(currentRead, std::memory_order_release);
   currentSyncIndex.store(writeIndex, std::memory_order_release);
 
@@ -281,7 +297,7 @@ bool setup(BelaContext* context, void* userData) {
            Bela_createAuxiliaryTask(&writeLogData, 50, "log-writer")) == 0)
     return false;
 
-    #if USE_OLED_DISPLAY
+#if USE_OLED_DISPLAY
   if ((gDisplayPinStatesTask = Bela_createAuxiliaryTask(
            &displayPinStates, 30, "display-pin-states")) == 0)
     return false;
@@ -425,7 +441,7 @@ void render(BelaContext* context, void* userData) {
   // Display update only when needed
 #if USE_OLED_DISPLAY
   static unsigned int lastDisplayUpdate = 0;
-  if (renderCount % (fs / periodSize / 10) == 0) { // Update every 100ms
+  if (renderCount % (fs / periodSize / 10) == 0) {  // Update every 100ms
     Bela_scheduleAuxiliaryTask(gDisplayPinStatesTask);
     lastDisplayUpdate = renderCount;
   }
@@ -436,7 +452,7 @@ void render(BelaContext* context, void* userData) {
     Bela_scheduleAuxiliaryTask(gResolveStreamsTask);
   }
 
-  // Pull samples more frequently when streams are available
+  // Pull samples more frequently, when streams are available
   if (!streamInlets.empty() && renderCount % 10 == 0) {
     Bela_scheduleAuxiliaryTask(gPullSamplesTask);
   }
@@ -452,6 +468,9 @@ void render(BelaContext* context, void* userData) {
 void cleanup(BelaContext* context, void* userData) {
   rt_fprintf(stderr,
              "Cleaning up...Please wait for the logs to finish writing.\n");
+
+  // Stop resolving streams first
+  shouldResolveStreams = false;
 
   // Final flush of event buffers
   int flushAttempts = 0;
@@ -469,17 +488,25 @@ void cleanup(BelaContext* context, void* userData) {
   ssd1306_end();
 #endif
 
-  // Clean up stream inlets
+  // Clean up stream inlets properly
   for (auto inlet : streamInlets) {
     if (inlet) {
-      inlet->close_stream();
+      try {
+        inlet->close_stream();
+      } catch (...) {
+        // Ignore exceptions during cleanup
+      }
       delete inlet;
     }
   }
   streamInlets.clear();
+  streamNames.clear();
 
   // Clean up resolver
-  delete resolver;
+  if (resolver) {
+    delete resolver;
+    resolver = nullptr;
+  }
 
   rt_printf("Cleanup complete. Events remaining: RT=%zu, LSL=%zu\n",
             rtEventQueue.size_approx(), lslEventQueue.size_approx());
@@ -561,37 +588,68 @@ void displayPinStates(void*) {
 }
 
 void pullSamples(void*) {
+
   if (!streamsResolved || streamInlets.empty()) return;
 
-  double receiveTime = lsl::local_clock();
-  std::vector<std::string> sampleBuffer(kMaxChannelsPerStream);
+  // Try to acquire lock - if already running, just return
+  bool expected = false;
+  if (!pullSamplesRunning.compare_exchange_strong(expected, true, std::memory_order_acquire)) {
+    printf("DEBUG: pullSamples already running, skipping\n");
+    return;
+  }
+
+  // Ensure we release the lock when function exits
+  struct LockGuard {
+    std::atomic<bool>* lock;
+    LockGuard(std::atomic<bool>* l) : lock(l) {}
+    ~LockGuard() { lock->store(false, std::memory_order_release); }
+  } guard(&pullSamplesRunning);
+
+  // double receiveTime = lsl::local_clock();
 
   for (size_t i = 0; i < streamInlets.size(); i++) {
+    printf("DEBUG: Processing inlet %zu\n", i);
+    if (!streamInlets[i]) {
+      printf("DEBUG: Inlet %zu is null, skipping\n", i);
+      continue;
+    }
     try {
+      printf("DEBUG: About to pull sample from inlet %zu\n", i);
+      char* buffer[1] = {nullptr};
       double sampleTimestamp =
-          streamInlets[i]->pull_sample(sampleBuffer, sampleTimeout);
-
+          streamInlets[i]->pull_sample(*buffer, 1, sampleTimeout);
+      printf("DEBUG: Pull completed for inlet %zu, timestamp: %f\n", i,
+             sampleTimestamp);
       if (sampleTimestamp != 0.0) {
+        // clear the buffer
+        printf("DEBUG: Valid sample received, creating event\n");
         // Create RT-safe event for LSL sample
         RTTimingEvent event;
         event.system_frame = gElapsedFrames;
         event.type = RTTimingEvent::LSL_SAMPLE;
 
-        // Copy stream name safely
+        // Copy stream name
         strncpy(event.stream_name, streamNames[i].c_str(),
                 kMaxStreamNameLength - 1);
         event.stream_name[kMaxStreamNameLength - 1] = '\0';
-
-        // Copy sample data
-        event.sample_data_count =
-            std::min(sampleBuffer.size(), kMaxChannelsPerStream);
-        memcpy(event.sample_data, sampleBuffer.data(),
-               event.sample_data_count * sizeof(float));
-
+        printf("DEBUG: Stream name copied: %s\n", event.stream_name);
+        // Copy string data
+        event.sample_data_count = 1;
+        for (size_t j = 0; j < event.sample_data_count; j++) {
+          strncpy(event.sample_data[j], buffer[j],
+                  RTTimingEvent::kMaxSampleStringLength - 1);
+          event.sample_data[j][RTTimingEvent::kMaxSampleStringLength - 1] =
+              '\0';
+        }
+        // Clean up allocated strings
+        if (buffer[0]) {
+          delete[] buffer[0];  // Free the allocated buffer
+          buffer[0] = nullptr;  // Avoid dangling pointer
+        }
         event.sample_timestamp = sampleTimestamp;
         event.pin_states_snapshot =
             currentPinStatesAtomic.load(std::memory_order_relaxed);
-
+        printf("DEBUG: About to push event to queue\n");
         // Push to LSL queue
         if (!lslEventQueue.push(event)) {
           rt_printf("LSL event queue full\n");
@@ -606,25 +664,26 @@ void pullSamples(void*) {
     } catch (std::exception& e) {
       rt_printf("Error pulling sample from %s: %s\n", streamNames[i].c_str(),
                 e.what());
+    } catch (...) {
+      rt_printf("Unknown error pulling sample from %s\n", streamNames[i].c_str());
     }
+  }
+  // Clean up null pointers
+  streamInlets.erase(
+      std::remove_if(streamInlets.begin(), streamInlets.end(),
+                     [](lsl::stream_inlet* inlet) { return inlet == nullptr; }),
+      streamInlets.end());
+
+  // Keep streamNames in sync
+  if (streamInlets.size() != streamNames.size()) {
+    streamNames.resize(streamInlets.size());
   }
 
-  // Clean up null pointers
-  auto it = streamInlets.begin();
-  auto nameIt = streamNames.begin();
-  while (it != streamInlets.end()) {
-    if (*it == nullptr) {
-      it = streamInlets.erase(it);
-      nameIt = streamNames.erase(nameIt);
-    } else {
-      ++it;
-      ++nameIt;
-    }
-  }
 
   if (streamInlets.empty()) {
     streamsResolved = false;
   }
+
 }
 
 void writeLogData(void*) {
@@ -639,7 +698,6 @@ void writeLogData(void*) {
 
   // Process RT events first (higher priority)
   while (rtEventQueue.pop(event) && eventsWritten < 1000) {
-    // Format CSV line - now using interpolated timestamp from event
     logFile << event.system_frame << "," << std::fixed << std::setprecision(9)
             << event.sample_timestamp << ",";
 
@@ -650,8 +708,9 @@ void writeLogData(void*) {
       logFile << "LSL_SAMPLE,,," << event.stream_name << ","
               << event.sample_timestamp << ",";
 
+      // Output string data from char arrays
       for (size_t i = 0; i < event.sample_data_count; i++) {
-        logFile << event.sample_data[i];
+        logFile << event.sample_data[i];  // char array outputs as string
         if (i < event.sample_data_count - 1) logFile << ";";
       }
       logFile << ",";
@@ -669,10 +728,8 @@ void writeLogData(void*) {
 
   // Process LSL events if we have room
   while (lslEventQueue.pop(event) && eventsWritten < 1500) {
-    // Get current LSL time for receive timestamp
     double currentLSLTime = lastLSLTimestamp.load(std::memory_order_relaxed);
 
-    // Format LSL event
     logFile << event.system_frame << "," << std::fixed << std::setprecision(9)
             << currentLSLTime << ","
             << "LSL_SAMPLE,,," << event.stream_name << ","
