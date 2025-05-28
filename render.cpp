@@ -21,8 +21,8 @@
 const int kOledI2cDev = 1;
 
 // Digital I/O pin configuration
-const unsigned int eventStartPins[] = {0, 1, 2, 3};
-const unsigned int eventEndPins[] = {12, 13, 14, 15};
+const unsigned int eventStartPins[] = {0, 12};
+const unsigned int eventEndPins[] = {1, 1};
 const unsigned int kNumStartPins =
     sizeof(eventStartPins) / sizeof(eventStartPins[0]);
 const unsigned int kNumEndPins = sizeof(eventEndPins) / sizeof(eventEndPins[0]);
@@ -42,7 +42,7 @@ const int logRandomSuffix = rand() % 10000;
 
 // Constants for pre-allocated buffers
 const size_t kMaxStreamNameLength = 64;
-const size_t kMaxChannelsPerStream = 32;
+const size_t kMaxChannelsPerStream = 1;
 
 // Lightweight event structure for real-time safe logging
 struct RTTimingEvent {
@@ -55,7 +55,7 @@ struct RTTimingEvent {
 
   // LSL sample data (fixed-size for RT safety)
   char stream_name[kMaxStreamNameLength];
-  float sample_data[kMaxChannelsPerStream];
+  std::string sample_data[kMaxChannelsPerStream];
   size_t sample_data_count;
   double sample_timestamp;  // This will store the interpolated LSL time
 
@@ -512,7 +512,7 @@ void resolveStreams(void*) {
     for (const auto& info : availableStreams) {
       if (!info.name().empty() && info.name().find(streamPrefixFilter) == 0) {
         try {
-          lsl::stream_inlet* inlet = new lsl::stream_inlet(info, 360, 0, true);
+          lsl::stream_inlet* inlet = new lsl::stream_inlet(info, 10, 1, true);
           streamInlets.push_back(inlet);
           streamNames.push_back(info.name());
           inlet->open_stream(1.0);
@@ -564,7 +564,7 @@ void pullSamples(void*) {
   if (!streamsResolved || streamInlets.empty()) return;
 
   double receiveTime = lsl::local_clock();
-  std::vector<float> sampleBuffer(kMaxChannelsPerStream);
+  std::vector<std::string> sampleBuffer(kMaxChannelsPerStream);
 
   for (size_t i = 0; i < streamInlets.size(); i++) {
     try {

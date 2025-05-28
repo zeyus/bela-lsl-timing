@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Sync BelaSysroot with Bela board
 
-BELA_IP=192.168.7.2
+BELA_IP=192.168.1.2
 
 CURRENT_DIR=$(pwd)
 
