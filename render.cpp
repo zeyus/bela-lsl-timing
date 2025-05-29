@@ -44,7 +44,8 @@ const size_t kFlushThreshold = 2048;
 const int logRandomSuffix = rand() % 10000;
 
 // Constants for pre-allocated buffers
-const size_t kMaxStreamNameLength = 64;
+const size_t kMaxStreamNameLength = 256;
+const size_t kMaxStreamSourceLength = 256;
 const size_t kMaxChannelsPerStream = 1;
 
 // Lightweight event structure for real-time safe logging
@@ -58,10 +59,11 @@ struct RTTimingEvent {
 
   // LSL sample data (fixed-size for RT safety)
   char stream_name[kMaxStreamNameLength];
+  char stream_source[kMaxStreamSourceLength];
   // static const size_t kMaxSampleStringLength = 256;
   uint64_t sample_data[kMaxChannelsPerStream];
   size_t sample_data_count;
-  uint64_t sample_timestamp;  // This will store the interpolated LSL time
+  double sample_timestamp;  // This will store the interpolated LSL time
 
   // Pin states snapshot
   uint16_t pin_states_snapshot;  // Bit field for up to 16 pins
@@ -75,6 +77,7 @@ struct RTTimingEvent {
         sample_timestamp(0.0),
         pin_states_snapshot(0) {
     memset(stream_name, 0, kMaxStreamNameLength);
+    memset(stream_source, 0, kMaxStreamSourceLength);
     memset(sample_data, 0, sizeof(sample_data));
   }
 };
@@ -126,6 +129,7 @@ std::atomic<bool> shouldResolveStreams{true};
 std::vector<lsl::stream_info> availableStreams;
 std::vector<lsl::stream_inlet*> streamInlets;
 std::vector<std::string> streamNames;
+std::vector<std::string> streamSources;
 bool streamsResolved = false;
 
 // RT-safe event queue
@@ -311,7 +315,7 @@ bool setup(BelaContext* context, void* userData) {
   std::ofstream logFile(kLogFileName, std::ios::out | std::ios::trunc);
   if (logFile.is_open()) {
     logFile << "system_timestamp,lsl_timestamp,event_type,pin_number,pin_state,"
-               "stream_name,sample_timestamp,sample_data,pin_states\n";
+               "stream_name,stream_source,sample_timestamp,sample_data,pin_states\n";
     logFile.close();
     rt_printf("Created log file: %s\n", kLogFileName.c_str());
   } else {
@@ -501,6 +505,7 @@ void cleanup(BelaContext* context, void* userData) {
   }
   streamInlets.clear();
   streamNames.clear();
+  streamSources.clear();
 
   // Clean up resolver
   if (resolver) {
@@ -528,26 +533,42 @@ void resolveStreams(void*) {
   }
 
   if (needToReopen) {
+    // Clean up existing inlets
     for (auto inlet : streamInlets) {
-      inlet->close_stream();
-      delete inlet;
+      if (inlet) {
+        inlet->close_stream();
+        delete inlet;
+      }
     }
     streamInlets.clear();
     streamNames.clear();
+    streamSources.clear();
 
     size_t validStreams = 0;
     for (const auto& info : availableStreams) {
-      if (!info.name().empty() && info.name().find(streamPrefixFilter) == 0) {
+      // Check if stream name contains the filter prefix
+      if (!info.name().empty() &&
+          info.name().find(streamPrefixFilter) != std::string::npos) {
+        if (info.channel_format() != lsl::cf_int64) {
+          rt_printf("Warning: Stream %s has format %d, expected int64 (%d)\n",
+                    info.name().c_str(),
+                    static_cast<int>(info.channel_format()),
+                    static_cast<int>(lsl::cf_int64));
+          // You can choose to skip this stream or handle format conversion
+          continue;
+        }
         try {
           lsl::stream_inlet* inlet = new lsl::stream_inlet(info, 10, 1, true);
           streamInlets.push_back(inlet);
           streamNames.push_back(info.name());
+          streamSources.push_back(info.source_id());
           inlet->open_stream(1.0);
           validStreams++;
 
-          rt_printf("Opened stream: %s (%s), %d channels\n",
+          rt_printf("Opened stream: %s (%s), %d channels, format: %d\n",
                     info.name().c_str(), info.type().c_str(),
-                    info.channel_count());
+                    info.channel_count(),
+                    static_cast<int>(info.channel_format()));
         } catch (std::exception& e) {
           rt_printf("Error creating inlet for %s: %s\n", info.name().c_str(),
                     e.what());
@@ -563,7 +584,7 @@ void resolveStreams(void*) {
     ssd1306_oled_write_line(SSD1306_FONT_NORMAL, (char*)streamStr.c_str());
 #endif
 
-    streamsResolved = true;
+    streamsResolved = (validStreams > 0);
   }
 }
 
@@ -588,74 +609,47 @@ void displayPinStates(void*) {
 }
 
 void pullSamples(void*) {
-
   if (!streamsResolved || streamInlets.empty()) return;
 
-  // // Try to acquire lock - if already running, just return
-  // bool expected = false;
-  // if (!pullSamplesRunning.compare_exchange_strong(expected, true, std::memory_order_acquire)) {
-  //   printf("DEBUG: pullSamples already running, skipping\n");
-  //   return;
-  // }
-
-  // // Ensure we release the lock when function exits
-  // struct LockGuard {
-  //   std::atomic<bool>* lock;
-  //   LockGuard(std::atomic<bool>* l) : lock(l) {}
-  //   ~LockGuard() { lock->store(false, std::memory_order_release); }
-  // } guard(&pullSamplesRunning);
-
-  // double receiveTime = lsl::local_clock();
-
   for (size_t i = 0; i < streamInlets.size(); i++) {
-    printf("DEBUG: Processing inlet %zu\n", i);
     if (!streamInlets[i]) {
-      printf("DEBUG: Inlet %zu is null, skipping\n", i);
       continue;
     }
+
     try {
-      printf("DEBUG: About to pull sample from inlet %zu\n", i);
-      int64_t* buffer[kMaxChannelsPerStream] = {nullptr};
+      // Create a proper buffer for int64 data
+      std::vector<int64_t> buffer(kMaxChannelsPerStream);
+
       double sampleTimestamp =
-          streamInlets[i]->pull_sample(*buffer, kMaxChannelsPerStream, sampleTimeout);
-      printf("DEBUG: Pull completed for inlet %zu, timestamp: %f\n", i,
-             sampleTimestamp);
+          streamInlets[i]->pull_sample(buffer, sampleTimeout);
+
       if (sampleTimestamp != 0.0) {
-        // clear the buffer
-        printf("DEBUG: Valid sample received, creating event\n");
         // Create RT-safe event for LSL sample
         RTTimingEvent event;
         event.system_frame = gElapsedFrames;
         event.type = RTTimingEvent::LSL_SAMPLE;
 
-        // Copy stream name
+        // Copy stream name safely
         strncpy(event.stream_name, streamNames[i].c_str(),
                 kMaxStreamNameLength - 1);
         event.stream_name[kMaxStreamNameLength - 1] = '\0';
-        printf("DEBUG: Stream name copied: %s\n", event.stream_name);
-        // copy sample data
-        event.sample_data_count = kMaxChannelsPerStream;
-        // loop through the buffer of int64_t pointers to copy data
-        // to the uint64_t sample_data array
-        for (size_t j = 0; j < kMaxChannelsPerStream; j++) {
-          if (buffer[j]) {
-            event.sample_data[j] = static_cast<uint64_t>(*buffer[j]);
-          } else {
-            event.sample_data[j] = 0;  // Handle null pointers gracefully
-          }
+
+        // Copy stream source safely
+        strncpy(event.stream_source, streamSources[i].c_str(),
+                kMaxStreamSourceLength - 1);
+        event.stream_source[kMaxStreamSourceLength - 1] = '\0';
+
+        // Copy sample data
+        event.sample_data_count =
+            std::min(static_cast<size_t>(kMaxChannelsPerStream), buffer.size());
+        for (size_t j = 0; j < event.sample_data_count; j++) {
+          event.sample_data[j] = static_cast<uint64_t>(buffer[j]);
         }
-      
-        // Clean up allocated buffer
-        for (size_t j = 0; j < kMaxChannelsPerStream; j++) {
-          if (buffer[j]) {
-            delete buffer[j];
-          }
-        }
-        
+
         event.sample_timestamp = sampleTimestamp;
         event.pin_states_snapshot =
             currentPinStatesAtomic.load(std::memory_order_relaxed);
-        printf("DEBUG: About to push event to queue\n");
+
         // Push to LSL queue
         if (!lslEventQueue.push(event)) {
           rt_printf("LSL event queue full\n");
@@ -671,9 +665,11 @@ void pullSamples(void*) {
       rt_printf("Error pulling sample from %s: %s\n", streamNames[i].c_str(),
                 e.what());
     } catch (...) {
-      rt_printf("Unknown error pulling sample from %s\n", streamNames[i].c_str());
+      rt_printf("Unknown error pulling sample from %s\n",
+                streamNames[i].c_str());
     }
   }
+
   // Clean up null pointers
   streamInlets.erase(
       std::remove_if(streamInlets.begin(), streamInlets.end(),
@@ -685,11 +681,14 @@ void pullSamples(void*) {
     streamNames.resize(streamInlets.size());
   }
 
+  // Update stream sources
+  if (streamSources.size() != streamInlets.size()) {
+    streamSources.resize(streamInlets.size());
+  }
 
   if (streamInlets.empty()) {
     streamsResolved = false;
   }
-
 }
 
 void writeLogData(void*) {
@@ -709,9 +708,10 @@ void writeLogData(void*) {
 
     if (event.type == RTTimingEvent::PIN_CHANGE) {
       logFile << "PIN_CHANGE," << event.pin_number << ","
-              << (event.pin_state ? "1" : "0") << ",,,";
+              << (event.pin_state ? "1" : "0") << ",,,,";
     } else {
       logFile << "LSL_SAMPLE,,," << event.stream_name << ","
+              << event.stream_source << ","
               << event.sample_timestamp << ",";
 
       // Output string data from uint64_t sample_data
@@ -739,6 +739,7 @@ void writeLogData(void*) {
     logFile << event.system_frame << "," << std::fixed << std::setprecision(9)
             << currentLSLTime << ","
             << "LSL_SAMPLE,,," << event.stream_name << ","
+            << event.stream_source << ","
             << event.sample_timestamp << ",";
 
     for (size_t i = 0; i < event.sample_data_count; i++) {
