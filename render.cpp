@@ -58,10 +58,10 @@ struct RTTimingEvent {
 
   // LSL sample data (fixed-size for RT safety)
   char stream_name[kMaxStreamNameLength];
-  static const size_t kMaxSampleStringLength = 256;
-  char sample_data[kMaxChannelsPerStream][kMaxSampleStringLength];
+  // static const size_t kMaxSampleStringLength = 256;
+  uint64_t sample_data[kMaxChannelsPerStream];
   size_t sample_data_count;
-  double sample_timestamp;  // This will store the interpolated LSL time
+  uint64_t sample_timestamp;  // This will store the interpolated LSL time
 
   // Pin states snapshot
   uint16_t pin_states_snapshot;  // Bit field for up to 16 pins
@@ -591,19 +591,19 @@ void pullSamples(void*) {
 
   if (!streamsResolved || streamInlets.empty()) return;
 
-  // Try to acquire lock - if already running, just return
-  bool expected = false;
-  if (!pullSamplesRunning.compare_exchange_strong(expected, true, std::memory_order_acquire)) {
-    printf("DEBUG: pullSamples already running, skipping\n");
-    return;
-  }
+  // // Try to acquire lock - if already running, just return
+  // bool expected = false;
+  // if (!pullSamplesRunning.compare_exchange_strong(expected, true, std::memory_order_acquire)) {
+  //   printf("DEBUG: pullSamples already running, skipping\n");
+  //   return;
+  // }
 
-  // Ensure we release the lock when function exits
-  struct LockGuard {
-    std::atomic<bool>* lock;
-    LockGuard(std::atomic<bool>* l) : lock(l) {}
-    ~LockGuard() { lock->store(false, std::memory_order_release); }
-  } guard(&pullSamplesRunning);
+  // // Ensure we release the lock when function exits
+  // struct LockGuard {
+  //   std::atomic<bool>* lock;
+  //   LockGuard(std::atomic<bool>* l) : lock(l) {}
+  //   ~LockGuard() { lock->store(false, std::memory_order_release); }
+  // } guard(&pullSamplesRunning);
 
   // double receiveTime = lsl::local_clock();
 
@@ -615,9 +615,9 @@ void pullSamples(void*) {
     }
     try {
       printf("DEBUG: About to pull sample from inlet %zu\n", i);
-      char* buffer[1] = {nullptr};
+      int64_t* buffer[kMaxChannelsPerStream] = {nullptr};
       double sampleTimestamp =
-          streamInlets[i]->pull_sample(*buffer, 1, sampleTimeout);
+          streamInlets[i]->pull_sample(*buffer, kMaxChannelsPerStream, sampleTimeout);
       printf("DEBUG: Pull completed for inlet %zu, timestamp: %f\n", i,
              sampleTimestamp);
       if (sampleTimestamp != 0.0) {
@@ -633,19 +633,25 @@ void pullSamples(void*) {
                 kMaxStreamNameLength - 1);
         event.stream_name[kMaxStreamNameLength - 1] = '\0';
         printf("DEBUG: Stream name copied: %s\n", event.stream_name);
-        // Copy string data
-        event.sample_data_count = 1;
-        for (size_t j = 0; j < event.sample_data_count; j++) {
-          strncpy(event.sample_data[j], buffer[j],
-                  RTTimingEvent::kMaxSampleStringLength - 1);
-          event.sample_data[j][RTTimingEvent::kMaxSampleStringLength - 1] =
-              '\0';
+        // copy sample data
+        event.sample_data_count = kMaxChannelsPerStream;
+        // loop through the buffer of int64_t pointers to copy data
+        // to the uint64_t sample_data array
+        for (size_t j = 0; j < kMaxChannelsPerStream; j++) {
+          if (buffer[j]) {
+            event.sample_data[j] = static_cast<uint64_t>(*buffer[j]);
+          } else {
+            event.sample_data[j] = 0;  // Handle null pointers gracefully
+          }
         }
-        // Clean up allocated strings
-        if (buffer[0]) {
-          delete[] buffer[0];  // Free the allocated buffer
-          buffer[0] = nullptr;  // Avoid dangling pointer
+      
+        // Clean up allocated buffer
+        for (size_t j = 0; j < kMaxChannelsPerStream; j++) {
+          if (buffer[j]) {
+            delete buffer[j];
+          }
         }
+        
         event.sample_timestamp = sampleTimestamp;
         event.pin_states_snapshot =
             currentPinStatesAtomic.load(std::memory_order_relaxed);
@@ -708,9 +714,9 @@ void writeLogData(void*) {
       logFile << "LSL_SAMPLE,,," << event.stream_name << ","
               << event.sample_timestamp << ",";
 
-      // Output string data from char arrays
+      // Output string data from uint64_t sample_data
       for (size_t i = 0; i < event.sample_data_count; i++) {
-        logFile << event.sample_data[i];  // char array outputs as string
+        logFile << event.sample_data[i];
         if (i < event.sample_data_count - 1) logFile << ";";
       }
       logFile << ",";
