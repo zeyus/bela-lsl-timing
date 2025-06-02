@@ -56,6 +56,7 @@ struct RTTimingEvent {
   // Pin change data
   int pin_number;
   bool pin_state;
+  bool is_start_pin;  // True if this is a start pin
 
   // LSL sample data (fixed-size for RT safety)
   char stream_name[kMaxStreamNameLength];
@@ -73,6 +74,7 @@ struct RTTimingEvent {
         type(PIN_CHANGE),
         pin_number(0),
         pin_state(false),
+        is_start_pin(false),
         sample_data_count(0),
         sample_timestamp(0.0),
         pin_states_snapshot(0) {
@@ -314,7 +316,7 @@ bool setup(BelaContext* context, void* userData) {
   // Initialize log file
   std::ofstream logFile(kLogFileName, std::ios::out | std::ios::trunc);
   if (logFile.is_open()) {
-    logFile << "system_timestamp,lsl_timestamp,event_type,pin_number,pin_state,"
+    logFile << "system_timestamp,lsl_timestamp,event_type,pin_number,pin_state,is_start_pin,"
                "stream_name,stream_source,sample_timestamp,sample_data,pin_states\n";
     logFile.close();
     rt_printf("Created log file: %s\n", kLogFileName.c_str());
@@ -381,6 +383,7 @@ void render(BelaContext* context, void* userData) {
         event.type = RTTimingEvent::PIN_CHANGE;
         event.pin_number = eventStartPins[j];
         event.pin_state = state;
+        event.is_start_pin = true;  // Mark as start pin
         event.pin_states_snapshot = newStates;
         event.sample_timestamp = frameLSLTime;  // Store interpolated LSL time
 
@@ -408,6 +411,7 @@ void render(BelaContext* context, void* userData) {
         event.type = RTTimingEvent::PIN_CHANGE;
         event.pin_number = eventEndPins[j];
         event.pin_state = state;
+        event.is_start_pin = false;  // Mark as end pin
         event.pin_states_snapshot = newStates;
         event.sample_timestamp = frameLSLTime;  // Store interpolated LSL time
 
@@ -708,9 +712,10 @@ void writeLogData(void*) {
 
     if (event.type == RTTimingEvent::PIN_CHANGE) {
       logFile << "PIN_CHANGE," << event.pin_number << ","
-              << (event.pin_state ? "1" : "0") << ",,,,";
+              << (event.pin_state ? "1" : "0") << ","
+              << (event.is_start_pin ? "1" : "0") << ",,,,,";
     } else {
-      logFile << "LSL_SAMPLE,,," << event.stream_name << ","
+      logFile << "LSL_SAMPLE,,,," << event.stream_name << ","
               << event.stream_source << ","
               << event.sample_timestamp << ",";
 
@@ -738,7 +743,7 @@ void writeLogData(void*) {
 
     logFile << event.system_frame << "," << std::fixed << std::setprecision(9)
             << currentLSLTime << ","
-            << "LSL_SAMPLE,,," << event.stream_name << ","
+            << "LSL_SAMPLE,,,," << event.stream_name << ","
             << event.stream_source << ","
             << event.sample_timestamp << ",";
 
